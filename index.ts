@@ -4,9 +4,8 @@ import { ChildProcess, spawn } from "node:child_process";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { extname, resolve, basename, join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 
-// ─── MCP Client ──────────────────────────────────────────────────
+// ─── MCP Client (newline-delimited JSON) ─────────────────────────
 let mcpProcess: ChildProcess | null = null;
 let requestId = 0;
 const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -16,30 +15,23 @@ function ensureMCP(apiKey: string): Promise<void> {
   if (initPromise) return initPromise;
 
   initPromise = new Promise((resolveInit, rejectInit) => {
-    const env = { ...process.env, Z_AI_API_KEY: apiKey, Z_AI_MODE: "ZAI" };
     mcpProcess = spawn("npx", ["-y", "@z_ai/mcp-server"], {
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, Z_AI_API_KEY: apiKey, Z_AI_MODE: "ZAI" },
       shell: true,
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let buffer = "";
     mcpProcess.stdout!.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
-      // MCP messages are framed: "Content-Length: N\r\n\r\n{json}"
-      while (true) {
-        const headerEnd = buffer.indexOf("\r\n\r\n");
-        if (headerEnd === -1) break;
-        const header = buffer.slice(0, headerEnd);
-        const match = header.match(/Content-Length:\s*(\d+)/i);
-        if (!match) break;
-        const len = parseInt(match[1], 10);
-        const bodyStart = headerEnd + 4;
-        if (buffer.length < bodyStart + len) break;
-        const jsonStr = buffer.slice(bodyStart, bodyStart + len);
-        buffer = buffer.slice(bodyStart + len);
+      // Process complete lines (newline-delimited JSON)
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // keep incomplete last line
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
         try {
-          const msg = JSON.parse(jsonStr);
+          const msg = JSON.parse(trimmed);
           if (msg.id != null && pending.has(msg.id)) {
             const { resolve, reject } = pending.get(msg.id)!;
             pending.delete(msg.id);
@@ -86,9 +78,8 @@ function sendMCP(method: string, params: any): Promise<any> {
     }
     const id = ++requestId;
     pending.set(id, { resolve, reject });
-    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-    const frame = `Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`;
-    mcpProcess.stdin!.write(frame);
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+    mcpProcess.stdin!.write(msg);
     // Timeout after 120s
     setTimeout(() => {
       if (pending.has(id)) {
@@ -101,9 +92,8 @@ function sendMCP(method: string, params: any): Promise<any> {
 
 function sendNotification(method: string, params: any) {
   if (!mcpProcess || mcpProcess.killed) return;
-  const msg = JSON.stringify({ jsonrpc: "2.0", method, params });
-  const frame = `Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`;
-  mcpProcess.stdin!.write(frame);
+  const msg = JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n";
+  mcpProcess.stdin!.write(msg);
 }
 
 async function callTool(name: string, args: Record<string, string>): Promise<string> {
@@ -134,7 +124,6 @@ function imageMediaType(path: string): string {
 
 function getApiKey(): string {
   if (process.env.Z_AI_API_KEY) return process.env.Z_AI_API_KEY;
-  // Try reading from pi's auth.json
   try {
     const authPath = join(homedir(), ".pi", "agent", "auth.json");
     const auth = JSON.parse(readFileSync(authPath, "utf-8"));
@@ -174,7 +163,6 @@ export default function (pi: ExtensionAPI) {
     const descriptions: string[] = [];
     for (let i = 0; i < event.images.length; i++) {
       try {
-        // Extract base64 from pi's image format
         let b64: string;
         const img = event.images[i];
         if (img.source?.data) {
