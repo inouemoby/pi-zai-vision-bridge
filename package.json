@@ -1,7 +1,7 @@
 {
   "name": "zai-vision-bridge",
-  "version": "1.0.0",
-  "description": "ZAI Vision MCP bridge for pi coding agent. Provides image analysis, PDF reading, and video description via GLM-4.6V.",
+  "version": "1.3.0",
+  "description": "ZAI Vision MCP bridge for pi coding agent. Provides image analysis, PDF reading, video description, screenshot capture, and UI comparison via GLM-4.6V.",
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./index.ts"]
