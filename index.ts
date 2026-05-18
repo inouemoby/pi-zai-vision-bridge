@@ -174,8 +174,8 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
 
-        const result = await callTool("image_analysis", {
-          image: `data:image/png;base64,${b64}`,
+        const result = await callTool("analyze_image", {
+          image_source: `data:image/png;base64,${b64}`,
           prompt: "Describe this image in complete detail, including all visible text, layout, colors, and elements.",
         });
         descriptions.push(`## Image ${i + 1}\n${result}`);
@@ -213,7 +213,7 @@ export default function (pi: ExtensionAPI) {
       onUpdate?.({ content: [{ type: "text", text: "Processing PDF via ZAI Vision MCP..." }] });
 
       const result = await callTool("extract_text_from_screenshot", {
-        image: resolve(pdfPath),
+        image_source: resolve(pdfPath),
         prompt: "Extract ALL text content from this document verbatim.",
       });
 
@@ -254,8 +254,8 @@ export default function (pi: ExtensionAPI) {
       onUpdate?.({ content: [{ type: "text", text: "Analyzing video via ZAI Vision MCP..." }] });
 
       const query = params.query || "Describe what is happening in this video.";
-      const result = await callTool("video_analysis", {
-        video_path: resolve(videoPath),
+      const result = await callTool("analyze_video", {
+        video_source: resolve(videoPath),
         prompt: query,
       });
 
