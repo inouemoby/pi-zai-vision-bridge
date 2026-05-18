@@ -1,9 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ChildProcess, spawn } from "node:child_process";
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, mkdirSync, rmSync } from "node:fs";
 import { extname, resolve, basename, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 
 // ─── MCP Client (newline-delimited JSON) ─────────────────────────
 let mcpProcess: ChildProcess | null = null;
@@ -132,6 +134,32 @@ function getApiKey(): string {
   return "";
 }
 
+const MAX_PAGES_PDF = 20;
+
+function hasPdftoppm(): boolean {
+  try { execSync("pdftoppm -v", { stdio: "ignore" }); return true; } catch { return false; }
+}
+
+function extractPDFPages(pdfPath: string, tempDir: string): string[] {
+  let pageCount = 1;
+  try {
+    const info = execSync(`pdfinfo "${pdfPath}"`, { encoding: "utf8" });
+    const match = info.match(/Pages:\s+(\d+)/);
+    if (match) pageCount = parseInt(match[1], 10);
+  } catch { /* default to 1 */ }
+
+  const pages = Math.min(pageCount, MAX_PAGES_PDF);
+  const outPrefix = join(tempDir, "page");
+  execSync(`pdftoppm -png -r 150 -f 1 -l ${pages} "${pdfPath}" "${outPrefix}"`, { stdio: "ignore" });
+
+  const result: string[] = [];
+  for (let i = 1; i <= pages; i++) {
+    const p = `${outPrefix}-${i}.png`;
+    if (existsSync(p)) result.push(p);
+  }
+  return result;
+}
+
 // ─── Main Extension ─────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   let initialized = false;
@@ -209,18 +237,40 @@ export default function (pi: ExtensionAPI) {
       const pdfPath = params.path;
       if (!existsSync(pdfPath)) throw new Error(`File not found: ${pdfPath}`);
 
+      if (!hasPdftoppm()) {
+        return {
+          content: [{ type: "text", text: "pdftoppm is not installed. PDF reading requires poppler-utils.\n\nInstall: https://poppler.freedesktop.org/" }],
+          isError: true,
+        };
+      }
+
       await ensureReady();
-      onUpdate?.({ content: [{ type: "text", text: "Processing PDF via ZAI Vision MCP..." }] });
 
-      const result = await callTool("extract_text_from_screenshot", {
-        image_source: resolve(pdfPath),
-        prompt: "Extract ALL text content from this document verbatim.",
-      });
+      const tempDir = join(tmpdir(), `pi-pdf-${randomUUID()}`);
+      mkdirSync(tempDir, { recursive: true });
 
-      return {
-        content: [{ type: "text", text: result }],
-        details: { fileName: basename(pdfPath) },
-      };
+      try {
+        const pageImages = extractPDFPages(pdfPath, tempDir);
+        onUpdate?.({ content: [{ type: "text", text: `Processing ${pageImages.length} page(s) via ZAI Vision MCP...` }] });
+
+        const results: string[] = [];
+        for (let i = 0; i < pageImages.length; i++) {
+          onUpdate?.({ content: [{ type: "text", text: `Reading page ${i + 1}/${pageImages.length}...` }] });
+          const b64 = readFileSync(pageImages[i]).toString("base64");
+          const text = await callTool("extract_text_from_screenshot", {
+            image_source: `data:image/png;base64,${b64}`,
+            prompt: "Extract ALL text content from this page verbatim. Include headings, body text, captions — everything readable.",
+          });
+          results.push(`## Page ${i + 1}\n${text}`);
+        }
+
+        return {
+          content: [{ type: "text", text: results.join("\n\n---\n\n") }],
+          details: { pages: results.length, fileName: basename(pdfPath) },
+        };
+      } finally {
+        try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ok */ }
+      }
     },
   });
 
