@@ -47,8 +47,18 @@ When using a **vision model** (e.g. glm-5v-turbo), images pass through natively 
 
 Two separate tools let the AI choose the right approach:
 
-- **`pdf_read`** — Uses `pdftotext` for direct text extraction. Instant, no MCP quota consumed. For normal PDFs (papers, documents, presentations).
-- **`pdf_read_ocr`** — Converts pages to images and processes them via ZAI Vision MCP. Slower, uses vision tokens. For scanned documents, handwritten notes, or image-based PDFs where `pdf_read` returns no usable text.
+- **`pdf_read`** — Uses `pdftotext` for direct text extraction. Instant, no MCP quota consumed. For normal PDFs (papers, documents, presentations). Supports arbitrary page ranges (e.g. `"100-110"`, `"5"`).
+- **`pdf_read_ocr`** — Converts pages to images and processes them via ZAI Vision MCP. Slower, uses vision tokens. For scanned documents, handwritten notes, or image-based PDFs where `pdf_read` returns no usable text. Supports up to 20 pages per call.
+
+### Large Output Handling
+
+Both PDF tools use pi's built-in truncation (50KB limit). When output exceeds the limit:
+
+1. The first 50KB is returned to the AI
+2. Full content is saved to a temporary file
+3. The AI is told the file path and can use `read` with `offset`/`limit` to access specific sections
+
+This prevents large PDFs (e.g. 80+ pages) from flooding the context window.
 
 ### Commands
 
