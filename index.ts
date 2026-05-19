@@ -268,9 +268,9 @@ export default function (pi: ExtensionAPI) {
   // ── pdf_read ────────────────────────────────────────────────
   pi.registerTool({
     name: "pdf_read",
-    label: "PDF Reader",
+    label: "PDF Text Reader",
     description:
-      "Read and extract text/content from PDF files using ZAI Vision MCP. Supports up to 20 pages per call. Requires pdftoppm (poppler-utils).",
+      "Read and extract text from text-based PDF files using pdftotext. Fast, no vision model needed. Use for normal PDFs (papers, documents, presentations). For scanned/image-based PDFs, use pdf_read_ocr instead.",
     promptSnippet: "Read PDF files using vision model",
     promptGuidelines: [
       "Use pdf_read to read content from PDF files when the user asks about a PDF document.",
@@ -280,23 +280,49 @@ export default function (pi: ExtensionAPI) {
       path: Type.String({ description: "Absolute path to the PDF file" }),
       pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3". Default: first 20 pages' })),
     }),
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
+      if (!hasPdftotext()) return err("pdftotext not installed. Install poppler-utils.");
+
+      const extracted = tryPdfTextExtract(params.path, params.pages);
+      if (!extracted) return err("No text extracted. The PDF may be image-based/scanned. Try pdf_read_ocr instead.");
+
+      const pageTexts = extracted.text.split("\f").filter((s: string) => s.trim());
+      const labeled = pageTexts.length <= 1
+        ? extracted.text
+        : pageTexts.map((t: string, i: number) => `## Page ${i + 1}\n${t.trim()}`).join("\n\n---\n\n");
+      return { content: [{ type: "text", text: labeled }] };
+    },
+
+    renderCall(args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("pdf_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Reading..."), 0, 0);
+      if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
+      const pages = (result.content?.[0]?.text?.match(/## Page/g) || []).length;
+      const label = pages > 0 ? `✓ ${pages} pages read (text)` : "✓ Read";
+      return new Text(theme.fg("success", label), 0, 0);
+    },
+  });
+
+  // ── pdf_read_ocr ───────────────────────────────────────────
+  pi.registerTool({
+    name: "pdf_read_ocr",
+    label: "PDF OCR Reader",
+    description:
+      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via ZAI Vision MCP. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils).",
+    promptSnippet: "Read scanned/image PDF files using vision OCR",
+    promptGuidelines: [
+      "Use pdf_read_ocr when pdf_read fails or returns empty results, indicating the PDF is image-based or scanned.",
+      "This tool is slower and uses vision model tokens. Prefer pdf_read for text-based PDFs.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "Absolute path to the PDF file" }),
+      pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3". Default: first 20 pages' })),
+    }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
-
-      // Step 1: try direct text extraction first (fast, no MCP needed)
-      if (hasPdftotext()) {
-        const extracted = tryPdfTextExtract(params.path, params.pages);
-        if (extracted) {
-          // Split by form-feed to label pages
-          const pageTexts = extracted.text.split("\f").filter((s: string) => s.trim());
-          const labeled = pageTexts.length <= 1
-            ? extracted.text
-            : pageTexts.map((t: string, i: number) => `## Page ${i + 1}\n${t.trim()}`).join("\n\n---\n\n");
-          return { content: [{ type: "text", text: labeled }] };
-        }
-      }
-
-      // Step 2: text extraction failed or too sparse — fall back to image-based OCR
       if (!hasPdftoppm()) return err("pdftoppm not installed. Install poppler-utils.");
       const initErr = await ensureReady();
       if (initErr) return err(initErr);
@@ -327,18 +353,18 @@ export default function (pi: ExtensionAPI) {
           ? results.join("\n\n---\n\n") + `\n\n---\n**Note:** ${errors.length} page(s) had issues: ${errors.join(", ")}`
           : results.join("\n\n---\n\n");
         return { content: [{ type: "text", text: output }] };
-      } catch (e: any) { return err(`PDF reading failed: ${e.message}`); }
+      } catch (e: any) { return err(`PDF OCR failed: ${e.message}`); }
       finally { try { rmSync(tempDir, { recursive: true, force: true }); } catch {} }
     },
 
     renderCall(args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("pdf_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
+      return new Text(theme.fg("toolTitle", theme.bold("pdf_read_ocr ")) + theme.fg("accent", basename(args.path)), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Processing..."), 0, 0);
+      if (isPartial) return new Text(theme.fg("warning", "OCR processing..."), 0, 0);
       if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
       const pages = (result.content?.[0]?.text?.match(/## Page/g) || []).length;
-      return new Text(theme.fg("success", `✓ ${pages} pages read`), 0, 0);
+      return new Text(theme.fg("success", `✓ ${pages} pages read (OCR)`), 0, 0);
     },
   });
 
