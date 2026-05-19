@@ -114,6 +114,37 @@ function hasPdftoppm(): boolean {
   try { execSync("pdftoppm -v", { stdio: "ignore" }); return true; } catch { return false; }
 }
 
+function hasPdftotext(): boolean {
+  try { execSync("pdftotext -v", { stdio: "ignore" }); return true; } catch { return false; }
+}
+
+// Try extracting text directly. Returns null if text too sparse (image-based PDF).
+function tryPdfTextExtract(pdfPath: string, pageRange?: string): { text: string; pages: number } | null {
+  const tmpFile = join(tmpdir(), `pi-pdf-text-${randomUUID()}.txt`);
+  try {
+    let args = "";
+    if (pageRange) {
+      // pdftotext supports -f first -l last page
+      const parts = pageRange.split("-").map(Number);
+      const first = parts[0] || 1;
+      const last = parts[1] || parts[0] || 999;
+      args = ` -f ${first} -l ${last}`;
+    }
+    execSync(`pdftotext${args} -layout "${pdfPath}" "${tmpFile}"`, { stdio: "ignore", timeout: 30_000 });
+    if (!existsSync(tmpFile)) return null;
+    const text = readFileSync(tmpFile, "utf8").trim();
+    if (!text) return null;
+    // Heuristic: if less than 50 non-whitespace chars per expected page, treat as image-based
+    const lines = text.split("\n").filter(l => l.trim().length > 0);
+    const totalChars = lines.reduce((sum, l) => sum + l.replace(/\s/g, "").length, 0);
+    const pageCount = Math.max(1, lines.filter(l => /^\f/.test(l)).length + 1); // form feeds separate pages
+    const charsPerPage = totalChars / pageCount;
+    if (charsPerPage < 30) return null; // too sparse, probably image-based
+    return { text, pages: pageCount };
+  } catch { return null; }
+  finally { try { rmSync(tmpFile, { force: true }); } catch {} }
+}
+
 function extractPDFPages(pdfPath: string, tempDir: string): string[] {
   let pageCount = 1;
   try {
@@ -238,11 +269,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pdf_read",
     label: "PDF Reader",
-    description: "Read and extract text/content from PDF files using ZAI Vision MCP. Supports up to 20 pages per call. Requires pdftoppm (poppler-utils).",
+    description:
+      "Read and extract text/content from PDF files using ZAI Vision MCP. Supports up to 20 pages per call. Requires pdftoppm (poppler-utils).",
     promptSnippet: "Read PDF files using vision model",
     promptGuidelines: [
       "Use pdf_read to read content from PDF files when the user asks about a PDF document.",
-      "pdf_read converts PDF pages to images and processes them with a vision model for text extraction.",
+      "For text-based PDFs, extraction is fast via pdftotext. For image-based/scanned PDFs, pages are converted to images and processed with a vision model.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the PDF file" }),
@@ -250,6 +282,21 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
+
+      // Step 1: try direct text extraction first (fast, no MCP needed)
+      if (hasPdftotext()) {
+        const extracted = tryPdfTextExtract(params.path, params.pages);
+        if (extracted) {
+          // Split by form-feed to label pages
+          const pageTexts = extracted.text.split("\f").filter((s: string) => s.trim());
+          const labeled = pageTexts.length <= 1
+            ? extracted.text
+            : pageTexts.map((t: string, i: number) => `## Page ${i + 1}\n${t.trim()}`).join("\n\n---\n\n");
+          return { content: [{ type: "text", text: labeled }] };
+        }
+      }
+
+      // Step 2: text extraction failed or too sparse — fall back to image-based OCR
       if (!hasPdftoppm()) return err("pdftoppm not installed. Install poppler-utils.");
       const initErr = await ensureReady();
       if (initErr) return err(initErr);
@@ -260,7 +307,7 @@ export default function (pi: ExtensionAPI) {
         const pageImages = extractPDFPages(params.path, tempDir);
         if (pageImages.length === 0) return err(`No pages extracted from ${basename(params.path)}. File may be corrupted.`);
 
-        onUpdate?.({ content: [{ type: "text", text: `Converting ${pageImages.length} pages...` }] });
+        onUpdate?.({ content: [{ type: "text", text: `OCR: converting ${pageImages.length} pages via vision...` }] });
 
         const vrList = await Promise.all(pageImages.map(imgPath =>
           callVisionTool("extract_text_from_screenshot", {
