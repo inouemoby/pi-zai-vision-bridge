@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ChildProcess, spawn } from "node:child_process";
 import { readFileSync, existsSync, statSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -13,6 +14,15 @@ let mcpProcess: ChildProcess | null = null;
 let requestId = 0;
 const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 let initPromise: Promise<void> | null = null;
+
+// Truncate large output, save full content to temp file if truncated.
+function truncateOutput(raw: string): string {
+  const t = truncateHead(raw, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+  if (!t.truncated) return raw;
+  const tmpFile = join(tmpdir(), `pi-pdf-${randomUUID()}.txt`);
+  try { writeFileSync(tmpFile, raw, "utf8"); } catch {}
+  return t.content + `\n\n[Output truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full content saved to: ${tmpFile}]`;
+}
 
 function ensureMCP(apiKey: string): Promise<void> {
   if (initPromise) return initPromise;
@@ -291,7 +301,7 @@ export default function (pi: ExtensionAPI) {
       const labeled = pageTexts.length <= 1
         ? extracted.text
         : pageTexts.map((t: string, i: number) => `## Page ${i + 1}\n${t.trim()}`).join("\n\n---\n\n");
-      return { content: [{ type: "text", text: labeled }] };
+      return { content: [{ type: "text", text: truncateOutput(labeled) }] };
     },
 
     renderCall(args, theme) {
