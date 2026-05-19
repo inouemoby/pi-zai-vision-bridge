@@ -37,10 +37,18 @@ When using a **vision model** (e.g. glm-5v-turbo), images pass through natively 
 | Tool | Description |
 |------|-------------|
 | `image_read` | Analyze image files when the model doesn't support vision |
-| `pdf_read` | Read and extract text from PDF files (up to 20 pages, requires [poppler-utils](https://poppler.freedesktop.org/)) |
+| `pdf_read` | Extract text from text-based PDFs via `pdftotext`. Fast, no vision model needed |
+| `pdf_read_ocr` | Read scanned/image-based PDFs via vision model OCR. Use when `pdf_read` returns empty results |
 | `video_describe` | Analyze video content (MP4/MOV/M4V, max 8MB) |
 | `screenshot` | Capture screen (full or specific window) and analyze UI layout **\*Windows only\*** |
 | `ui_compare` | Capture screen and compare with a design reference image **\*Windows only\*** |
+
+### PDF Reading Strategy
+
+Two separate tools let the AI choose the right approach:
+
+- **`pdf_read`** — Uses `pdftotext` for direct text extraction. Instant, no MCP quota consumed. For normal PDFs (papers, documents, presentations).
+- **`pdf_read_ocr`** — Converts pages to images and processes them via ZAI Vision MCP. Slower, uses vision tokens. For scanned documents, handwritten notes, or image-based PDFs where `pdf_read` returns no usable text.
 
 ### Commands
 
@@ -52,7 +60,7 @@ When using a **vision model** (e.g. glm-5v-turbo), images pass through natively 
 
 All tools isolate their internal workings from the pi interface:
 
-- **UI display**: Only shows minimal status (e.g., `Processing...` → `✓ 5 pages read` or `Failed`)
+- **UI display**: Only shows minimal status (e.g., `Reading...` → `✓ 3 pages read (text)` or `Failed`)
 - **AI access**: Full extracted text/results are available to the AI for answering questions
 - **Errors**: Descriptive messages for the AI to diagnose (e.g., `PDF not found: /path/to/file`), but no raw MCP protocol data, base64, or stack traces are ever exposed
 - **Screenshots**: Temporary files are deleted immediately after analysis
@@ -60,7 +68,8 @@ All tools isolate their internal workings from the pi interface:
 ## Platform Notes
 
 - **screenshot** and **ui_compare** use Windows PowerShell for screen capture and are **Windows-only**. The `window` parameter captures a specific window by title substring (e.g., `"Chrome"`, `"VS Code"`).
-- **pdf_read** requires [poppler-utils](https://poppler.freedesktop.org/) (`pdftoppm`) to be installed. On Windows, add it to your PATH.
+- **pdf_read** requires [poppler-utils](https://poppler.freedesktop.org/) (`pdftotext`) for text extraction.
+- **pdf_read_ocr** requires [poppler-utils](https://poppler.freedesktop.org/) (`pdftoppm`) for page-to-image conversion.
 - Other tools (`image_read`, `video_describe`, auto image intercept) work on all platforms.
 
 ## Quota
