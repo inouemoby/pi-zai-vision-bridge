@@ -280,15 +280,17 @@ export default function (pi: ExtensionAPI) {
     name: "pdf_read",
     label: "PDF Text Reader",
     description:
-      "Read and extract text from text-based PDF files using pdftotext. Fast, no vision model needed. Use for normal PDFs (papers, documents, presentations). For scanned/image-based PDFs, use pdf_read_ocr instead.",
+      "Read and extract text from text-based PDF files using pdftotext. Fast, no vision model needed. Use for normal PDFs (papers, documents, presentations). For scanned/image-based PDFs, use pdf_read_ocr instead. Supports arbitrary page ranges (e.g. \"100-110\", \"5\"). Large outputs are truncated to 50KB with full content saved to a temp file that can be read with the read tool.",
     promptSnippet: "Read PDF files using vision model",
     promptGuidelines: [
       "Use pdf_read to read content from PDF files when the user asks about a PDF document.",
-      "For text-based PDFs, extraction is fast via pdftotext. For image-based/scanned PDFs, pages are converted to images and processed with a vision model.",
+      "Extraction is fast via pdftotext, no MCP quota consumed. For image-based/scanned PDFs, use pdf_read_ocr instead.",
+      "Supports arbitrary page ranges — you can read page 100-110 without reading the whole document.",
+      "If output is truncated, a temp file path is provided. Use the read tool with offset/limit to access specific sections.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the PDF file" }),
-      pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3". Default: first 20 pages' })),
+      pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3" or "100-110". Omit for all pages.' })),
     }),
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
@@ -321,15 +323,16 @@ export default function (pi: ExtensionAPI) {
     name: "pdf_read_ocr",
     label: "PDF OCR Reader",
     description:
-      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via ZAI Vision MCP. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils).",
+      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via ZAI Vision MCP. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils). Large outputs are truncated to 50KB with full content saved to a temp file.",
     promptSnippet: "Read scanned/image PDF files using vision OCR",
     promptGuidelines: [
       "Use pdf_read_ocr when pdf_read fails or returns empty results, indicating the PDF is image-based or scanned.",
       "This tool is slower and uses vision model tokens. Prefer pdf_read for text-based PDFs.",
+      "If output is truncated, a temp file path is provided. Use the read tool with offset/limit to access specific sections.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the PDF file" }),
-      pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3". Default: first 20 pages' })),
+      pages: Type.Optional(Type.String({ description: 'Page range, e.g. "1-5" or "3". Default: first 20 pages. Max 20 pages per call.' })),
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
