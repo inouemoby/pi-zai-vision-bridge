@@ -7,7 +7,7 @@ Provides image analysis, PDF reading, video description, screenshot capture, and
 ## Install
 
 ```bash
-pi install https://github.com/inouemoby/pi-zai-vision-bridge.git
+pi install git:github.com/inouemoby/pi-zai-vision-bridge
 ```
 
 ## Setup
