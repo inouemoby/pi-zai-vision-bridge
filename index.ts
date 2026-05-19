@@ -281,7 +281,7 @@ export default function (pi: ExtensionAPI) {
     label: "PDF Text Reader",
     description:
       "Read and extract text from text-based PDF files using pdftotext. Fast, no vision model needed. Use for normal PDFs (papers, documents, presentations). For scanned/image-based PDFs, use pdf_read_ocr instead. Supports arbitrary page ranges (e.g. \"100-110\", \"5\"). Large outputs are truncated to 50KB with full content saved to a temp file that can be read with the read tool.",
-    promptSnippet: "Read PDF files using vision model",
+    promptSnippet: "Read text-based PDF files using pdftotext",
     promptGuidelines: [
       "Use pdf_read to read content from PDF files when the user asks about a PDF document.",
       "Extraction is fast via pdftotext, no MCP quota consumed. For image-based/scanned PDFs, use pdf_read_ocr instead.",
@@ -464,7 +464,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "screenshot",
     label: "Screenshot",
-    description: "Capture a screenshot and analyze it using ZAI Vision MCP. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis.",
+    description: "Capture a screenshot and analyze it using ZAI Vision MCP. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis. Windows only (uses PowerShell for capture).",
+    promptGuidelines: [
+      "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
+      "If the user mentions a specific app or window, pass it as the 'window' parameter.",
+      "Use this to understand layout, check component rendering, debug visual issues, or verify UI behavior.",
+      "Windows only — uses PowerShell for screen capture.",
     promptSnippet: "Capture and analyze screen for UI development",
     promptGuidelines: [
       "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
@@ -526,11 +531,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ui_compare",
     label: "UI Compare",
-    description: "Capture a screenshot and compare it against a reference design image using ZAI Vision MCP. Supports specific window capture. Designed to compare design mockup with actual implementation.",
+    description: "Capture a screenshot and compare it against a reference design image using ZAI Vision MCP. Supports specific window capture. Designed to compare design mockup with actual implementation. Windows only.",
     promptSnippet: "Compare screen with design reference for UI diff",
     promptGuidelines: [
       "Use ui_compare when you need to compare the current screen with a design mockup or reference image.",
       "ui_compare captures a screenshot and compares it with the reference image for visual diff analysis.",
+      "Windows only — uses PowerShell for screen capture.",
     ],
     parameters: Type.Object({
       reference: Type.String({ description: "Absolute path to the reference/design image file" }),
