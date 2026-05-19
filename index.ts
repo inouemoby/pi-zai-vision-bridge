@@ -115,7 +115,7 @@ function hasPdftoppm(): boolean {
 }
 
 function hasPdftotext(): boolean {
-  try { execSync("pdftotext -v", { stdio: "ignore" }); return true; } catch { return false; }
+  try { const r = execSync("pdftotext -v", { encoding: "utf8", stdio: ["pipe","pipe","pipe"] }); return true; } catch (e: any) { return (e.stdout || "").includes("pdftotext") || (e.stderr || "").includes("pdftotext"); }
 }
 
 // Try extracting text directly. Returns null if text too sparse (image-based PDF).
