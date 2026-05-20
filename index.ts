@@ -465,16 +465,12 @@ export default function (pi: ExtensionAPI) {
     name: "screenshot",
     label: "Screenshot",
     description: "Capture a screenshot and analyze it using ZAI Vision MCP. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis. Windows only (uses PowerShell for capture).",
-    promptGuidelines: [
-      "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
-      "If the user mentions a specific app or window, pass it as the 'window' parameter.",
-      "Use this to understand layout, check component rendering, debug visual issues, or verify UI behavior.",
-      "Windows only — uses PowerShell for screen capture.",
     promptSnippet: "Capture and analyze screen for UI development",
     promptGuidelines: [
       "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
       "If the user mentions a specific app or window, pass it as the 'window' parameter.",
       "Use this to understand layout, check component rendering, debug visual issues, or verify UI behavior.",
+      "Windows only — uses PowerShell for screen capture.",
     ],
     parameters: Type.Object({
       window: Type.Optional(Type.String({ description: "Window title substring to capture (e.g., 'Chrome', 'VS Code'). Omit for full screen." })),
