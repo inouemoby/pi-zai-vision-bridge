@@ -586,20 +586,4 @@ export default function (pi: ExtensionAPI) {
       return new Text(theme.fg("success", "✓ UI compared"), 0, 0);
     },
   });
-
-  // ── /zai-vision-login ───────────────────────────────────────
-  pi.registerCommand("zai-vision-login", {
-    description: "Set ZAI API key for vision MCP",
-    handler: async (args, ctx) => {
-      const t = (args ?? "").trim();
-      let key: string;
-      if (t) { key = t; } else {
-        const input = await ctx.ui.input("ZAI Vision Login - API Key:");
-        if (!input?.trim()) return ctx.ui.notify("Cancelled.", "warning");
-        key = input.trim();
-      }
-      process.env.Z_AI_API_KEY = key;
-      ctx.ui.notify("✓ API key set.", "success");
-    },
-  });
 }
