@@ -12,12 +12,17 @@ pi install git:github.com/inouemoby/pi-zai-vision-bridge
 
 ## Setup
 
-The extension automatically reads your ZAI API key from `~/.pi/agent/auth.json`. If you already have a `zai` provider configured in pi, no extra setup needed.
+The extension automatically reads your ZAI API key from `~/.pi/agent/auth.json`. If you already have a `zai` provider configured via `/login`, no extra setup needed.
 
-Otherwise, set the API key manually:
+To add the key manually, edit `~/.pi/agent/auth.json`:
 
-```
-/zai-vision-login <your-api-key>
+```json
+{
+  "zai": {
+    "type": "api_key",
+    "key": "your-api-key-here"
+  }
+}
 ```
 
 ## Features
@@ -59,12 +64,6 @@ Both PDF tools use pi's built-in truncation (50KB limit). When output exceeds th
 3. The AI is told the file path and can use `read` with `offset`/`limit` to access specific sections
 
 This prevents large PDFs (e.g. 80+ pages) from flooding the context window.
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `/zai-vision-login` | Set ZAI API key |
 
 ### Output Isolation
 
