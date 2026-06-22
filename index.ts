@@ -9,52 +9,17 @@ import { execSync } from "node:child_process";
 import { Text } from "@earendil-works/pi-tui";
 
 // ─── GLM-4.1V-Thinking-Flash API Client ────────────────────────
+// This model is trained on SINGLE-TURN dialogue only. No multi-turn context.
+// Every call is independent: image + prompt → single response.
+// For "follow-up" questions, the caller re-sends the image with a new prompt.
 const ZAI_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 const ZAI_VISION_MODEL = "glm-4.1v-thinking-flash";
 
-// Default comprehensive prompt when caller has no specific question.
-// Asks for exhaustive detail so pi can decide what to follow up on.
+// Default prompt used when no specific question is given.
+// Used ONLY when params.prompt is empty/omitted.
+// Replaced entirely by params.prompt when one is provided.
 const DEFAULT_SCAN_PROMPT =
-  "Examine this image thoroughly. Provide a structured description covering: " +
-  "1) Overall scene and subject matter " +
-  "2) All visible objects, people, text (transcribe verbatim) " +
-  "3) Colors, layout, composition " +
-  "4) Any UI elements, diagrams, charts, or technical content " +
-  "5) Notable details, anomalies, or points that may need clarification. " +
-  "Be specific and exhaustive — you will be asked follow-up questions.";
-
-// ─── Vision conversation sessions ───────────────────────────────
-interface VisionSession {
-  imageDataUrls: string[];  // cached image data URLs (sent every turn)
-  messages: { role: string; content: any }[];  // text-only Q&A history
-  createdAt: number;
-}
-const sessions = new Map<string, VisionSession>();
-const SESSION_TTL_MS = 10 * 60 * 1000;  // 10 minutes
-
-function newSession(images: string[]): string {
-  const id = randomUUID().slice(0, 8);
-  sessions.set(id, { imageDataUrls: images, messages: [], createdAt: Date.now() });
-  return id;
-}
-
-function getSession(id: string): VisionSession | null {
-  const s = sessions.get(id);
-  if (!s) return null;
-  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
-    sessions.delete(id);
-    return null;
-  }
-  return s;
-}
-
-// Clean up expired sessions periodically
-function cleanSessions() {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    if (now - s.createdAt > SESSION_TTL_MS) sessions.delete(id);
-  }
-}
+  "Describe this image in detail. Cover what you see: subjects, objects, text (transcribe verbatim), colors, layout, and any notable details. Be thorough.";
 
 // Truncate large output, save full content to temp file if truncated.
 function truncateOutput(raw: string): string {
@@ -65,7 +30,7 @@ function truncateOutput(raw: string): string {
   return t.content + `\n\n[Output truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full content saved to: ${tmpFile}]`;
 }
 
-// Read file and return base64 string (no data URI prefix, ZAI accepts raw base64)
+// Read file and return base64 string
 function fileToBase64(filePath: string): string {
   const buf = readFileSync(filePath);
   return buf.toString("base64");
@@ -88,81 +53,48 @@ function cleanResponse(text: string): string {
     .trim();
 }
 
-type VisionResult = { ok: true; text: string; sessionId?: string } | { ok: false; error: string };
+type VisionResult = { ok: true; text: string } | { ok: false; error: string };
 
 /**
- * Call GLM-4.1V vision API. Supports multi-turn conversations:
- * - First call (no sessionId): creates a session, sends image + prompt
- * - Follow-up (with sessionId): replays history + image, appends new question
+ * Call GLM-4.1V vision API — single-turn only.
  *
- * The image is re-sent every turn (vision models need it in context).
- * Text Q&A history is maintained internally.
+ * - prompt empty → uses DEFAULT_SCAN_PROMPT (comprehensive description)
+ * - prompt provided → REPLACES default prompt entirely
+ *
+ * For follow-up questions on the same image, call again with the same image path
+ * and a new specific prompt (e.g., "read the text in the top-right corner").
  */
 async function callVision(
   prompt: string,
-  opts: { images?: string[]; video?: string; sessionId?: string } = {}
+  opts: { images?: string[]; video?: string } = {}
 ): Promise<VisionResult> {
-  cleanSessions();
   const apiKey = getApiKey();
   if (!apiKey) return { ok: false, error: "ZAI API key not found" };
 
-  let session: VisionSession | null = null;
-  let sessionId = opts.sessionId || "";
+  const effectivePrompt = prompt.trim() || DEFAULT_SCAN_PROMPT;
 
-  if (sessionId) {
-    session = getSession(sessionId);
-    if (!session) return { ok: false, error: `Session ${sessionId} expired or not found` };
-  } else {
-    // New session: build image data URLs
-    const dataUrls: string[] = [];
-    for (const imgPath of opts.images || []) {
-      try {
-        const mime = mimeFromPath(imgPath);
-        const b64 = fileToBase64(imgPath);
-        dataUrls.push(`data:${mime};base64,${b64}`);
-      } catch {
-        return { ok: false, error: `Failed to read image: ${imgPath}` };
-      }
-    }
-    if (opts.video) {
-      try {
-        const b64 = fileToBase64(opts.video);
-        dataUrls.push(`data:video/mp4;base64,${b64}`);
-      } catch {
-        return { ok: false, error: `Failed to read video: ${opts.video}` };
-      }
-    }
-    sessionId = newSession(dataUrls);
-    session = sessions.get(sessionId)!;
-  }
+  const content: any[] = [];
 
-  // Build the messages array for this turn:
-  // First user message includes the image(s) + first question.
-  // Subsequent messages are text-only Q&A (image already in context via first turn).
-  const apiMessages: any[] = [];
-
-  // Reconstruct first message with images
-  const firstContent: any[] = [];
-  for (const url of session.imageDataUrls) {
-    if (url.startsWith("data:image")) {
-      firstContent.push({ type: "image_url", image_url: { url } });
-    } else if (url.startsWith("data:video")) {
-      firstContent.push({ type: "video_url", video_url: { url } });
+  for (const imgPath of opts.images || []) {
+    try {
+      const mime = mimeFromPath(imgPath);
+      const b64 = fileToBase64(imgPath);
+      content.push({ type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } });
+    } catch {
+      return { ok: false, error: `Failed to read image: ${imgPath}` };
     }
   }
 
-  // Determine the effective prompt for this turn
-  const effectivePrompt = (!session.messages.length && !prompt)
-    ? DEFAULT_SCAN_PROMPT
-    : prompt;
-
-  firstContent.push({ type: "text", text: effectivePrompt });
-  apiMessages.push({ role: "user", content: firstContent });
-
-  // Append text-only history (assistant answers + prior user questions)
-  for (const msg of session.messages) {
-    apiMessages.push({ role: msg.role, content: msg.content });
+  if (opts.video) {
+    try {
+      const b64 = fileToBase64(opts.video);
+      content.push({ type: "video_url", video_url: { url: `data:video/mp4;base64,${b64}` } });
+    } catch {
+      return { ok: false, error: `Failed to read video: ${opts.video}` };
+    }
   }
+
+  content.push({ type: "text", text: effectivePrompt });
 
   try {
     const resp = await fetch(ZAI_API_URL, {
@@ -173,7 +105,7 @@ async function callVision(
       },
       body: JSON.stringify({
         model: ZAI_VISION_MODEL,
-        messages: apiMessages,
+        messages: [{ role: "user", content }],
       }),
     });
 
@@ -185,13 +117,7 @@ async function callVision(
     const data = await resp.json() as any;
     const rawText = data.choices?.[0]?.message?.content;
     if (!rawText) return { ok: false, error: "Empty response from vision model" };
-    const text = cleanResponse(rawText);
-
-    // Save this turn to history
-    session.messages.push({ role: "user", content: effectivePrompt });
-    session.messages.push({ role: "assistant", content: text });
-
-    return { ok: true, text, sessionId };
+    return { ok: true, text: cleanResponse(rawText) };
   } catch (e: any) {
     return { ok: false, error: e?.message || "Vision API call failed" };
   }
@@ -475,51 +401,36 @@ export default function (pi: ExtensionAPI) {
     name: "image_read",
     label: "Image Reader",
     description:
-      "Read and analyze image files using GLM-4.1V-Thinking-Flash vision model (64k context). Use when the current model does not support image input (PNG, JPG, WEBP, GIF, BMP). Supports multi-turn follow-up questions via session_id.",
+      "Read and analyze image files using GLM-4.1V-Thinking-Flash vision model. Use when the current model does not support image input (PNG, JPG, WEBP, GIF, BMP). Single-turn: each call is independent.",
     promptSnippet: "Read image files using vision model",
     promptGuidelines: [
       "Use image_read when you need to analyze an image file but the current model does not support image input.",
       "When the built-in read tool returns 'model does not support images' for an image file, use image_read instead.",
-      "MULTI-TURN STRATEGY: The first call returns a session_id. If the initial description lacks detail relevant to the task, call image_read again with the same session_id and a specific follow-up prompt about details you need.",
-      "If you don't know what's in the image, omit the prompt on the first call — the tool will request a comprehensive scan. Then follow up with targeted questions.",
-      "If you know exactly what you need (e.g., 'extract all text', 'count objects'), provide it as the prompt.",
+      "FOLLOW-UP STRATEGY: This model is single-turn. If the first description lacks detail you need, call image_read AGAIN with the SAME image path and a NEW prompt targeting the specific aspect (e.g., 'read all text in the image', 'describe the object in the top-left corner').",
+      "If you don't know what's in the image, omit the prompt — the tool will do a comprehensive scan. Then follow up with targeted prompts.",
+      "If you know exactly what you need (e.g., 'extract all text', 'count objects'), provide it as the prompt — it replaces the default comprehensive scan.",
     ],
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: "Absolute path to the image file. Required for first call. Omit when using session_id for follow-up." })),
-      prompt: Type.Optional(Type.String({ description: "What to analyze. If omitted on first call, a comprehensive scan is performed. On follow-up calls, provide specific detail to probe." })),
-      session_id: Type.Optional(Type.String({ description: "Session ID from a previous image_read call, to continue asking questions about the same image." })),
+      path: Type.String({ description: "Absolute path to the image file" }),
+      prompt: Type.Optional(Type.String({ description: "What to analyze. If omitted, a comprehensive scan is performed. If provided, REPLACES the default scan — use for targeted questions like 'read all text', 'describe the top-right corner'." })),
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
+      if (!existsSync(params.path)) return err(`Image not found: ${params.path}`);
       const initErr = await ensureReady();
       if (initErr) return err(initErr);
 
-      // Follow-up call: continue existing session
-      if (params.session_id) {
-        if (!params.prompt) return err("Follow-up call requires a 'prompt' with the specific question.");
-        onUpdate?.({ content: [{ type: "text", text: "Probing for details..." }] });
-        const vr = await callVision(params.prompt, { sessionId: params.session_id });
-        if (!vr.ok) return err(vr.error);
-        return { content: [{ type: "text", text: vr.text }] };
-      }
-
-      // First call: new session
-      if (!params.path) return err("'path' is required for the first call (or provide session_id for follow-up).");
-      if (!existsSync(params.path)) return err(`Image not found: ${params.path}`);
       onUpdate?.({ content: [{ type: "text", text: "Analyzing image..." }] });
 
       const vr = await callVision(
-        params.prompt || "",  // empty → DEFAULT_SCAN_PROMPT kicks in
+        params.prompt || "",
         { images: [resolve(params.path)] }
       );
       if (!vr.ok) return err(vr.error);
-      const sessionId = vr.sessionId!;
-      return {
-        content: [{ type: "text", text: vr.text + `\n\n---\n[session_id: ${sessionId}] Call image_read again with this session_id to ask follow-up questions.` }],
-      };
+      return { content: [{ type: "text", text: vr.text }] };
     },
 
     renderCall(args, theme) {
-      if (args.session_id) return new Text(theme.fg("toolTitle", theme.bold("image_read ")) + theme.fg("dim", `follow-up ${args.session_id}`), 0, 0);
+      if (args.prompt) return new Text(theme.fg("toolTitle", theme.bold("image_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
       return new Text(theme.fg("toolTitle", theme.bold("image_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
