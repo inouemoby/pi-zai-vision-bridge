@@ -485,7 +485,7 @@ export default function (pi: ExtensionAPI) {
       "If you know exactly what you need (e.g., 'extract all text', 'count objects'), provide it as the prompt.",
     ],
     parameters: Type.Object({
-      path: Type.String({ description: "Absolute path to the image file (ignored if session_id is provided for follow-up)" }),
+      path: Type.Optional(Type.String({ description: "Absolute path to the image file. Required for first call. Omit when using session_id for follow-up." })),
       prompt: Type.Optional(Type.String({ description: "What to analyze. If omitted on first call, a comprehensive scan is performed. On follow-up calls, provide specific detail to probe." })),
       session_id: Type.Optional(Type.String({ description: "Session ID from a previous image_read call, to continue asking questions about the same image." })),
     }),
