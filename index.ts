@@ -8,17 +8,52 @@ import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { Text } from "@earendil-works/pi-tui";
 
-// ─── GLM-4.1V-Thinking-Flash API Client ────────────────────────
-// This model is trained on SINGLE-TURN dialogue only. No multi-turn context.
-// Every call is independent: image + prompt → single response.
-// For "follow-up" questions, the caller re-sends the image with a new prompt.
+// ─── Backend Configuration ────────────────────────────────────
+// DEFAULT: Gemma 4 (Ollama Cloud) with mini agent loop (crop_image tool)
+// FALLBACK: GLM-4.1V-Thinking-Flash (ZAI) — single-turn, when no Ollama key
+
+// ─── ZAI (fallback) ───────────────────────────────────────────
 const ZAI_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 const ZAI_VISION_MODEL = "glm-4.1v-thinking-flash";
 
+// ─── Gemma 4 (default) ────────────────────────────────────────
+// Gemma 4 has a fixed 280-token image budget (Ollama hardcodes max_soft_tokens).
+// Large images get aggressively compressed, losing fine details/small text.
+// Solution: mini agent loop — gemma4 reverse-calls crop_image to zoom into
+// specific regions, getting higher effective resolution on areas of interest.
+const OLLAMA_API_URL = "https://ollama.com/api/chat";
+const GEMMA4_MODEL = "gemma4:31b";
+const MAX_AGENT_ROUNDS = 15;
+
+// Appended to every prompt when using gemma4 agent loop.
+const CROP_HINT =
+  "\n\nIf any part of the image is too small or unclear to analyze accurately, " +
+  "use the crop_image tool to zoom into that region for a clearer view. " +
+  "You may crop multiple regions until you have enough detail. " +
+  "When you have sufficient information, provide your final answer WITHOUT calling any tool.";
+
+const CROP_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "crop_image",
+    description:
+      "Crop a rectangular region of the image to view at higher resolution. " +
+      "Use when text or fine details are too small/blurry to read. " +
+      "Coordinates normalized 0-1000 (per-mille of image dimensions; x=horizontal, y=vertical; origin=top-left).",
+    parameters: {
+      type: "object",
+      properties: {
+        x1: { type: "number", description: "Left boundary (0-1000)" },
+        y1: { type: "number", description: "Top boundary (0-1000)" },
+        x2: { type: "number", description: "Right boundary (0-1000)" },
+        y2: { type: "number", description: "Bottom boundary (0-1000)" },
+      },
+      required: ["x1", "y1", "x2", "y2"],
+    },
+  },
+};
+
 // Default prompt used when no specific question is given.
-// Used ONLY when params.prompt is empty/omitted.
-// Replaced entirely by params.prompt when one is provided.
-// Designed for GLM-4.1V-Thinking: concise, factual, no filler/flattery.
 const DEFAULT_SCAN_PROMPT =
   "You are a visual analysis assistant. Analyze the provided image and output a factual report.\n\n" +
   "Format your response as follows:\n" +
@@ -33,7 +68,7 @@ const DEFAULT_SCAN_PROMPT =
   "- If you are unsure of exact text, mark it as [unclear].\n" +
   "- Be concise. No introductory or concluding remarks.";
 
-// Truncate large output, save full content to temp file if truncated.
+// ─── Output truncation ────────────────────────────────────────
 function truncateOutput(raw: string): string {
   const t = truncateHead(raw, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
   if (!t.truncated) return raw;
@@ -42,13 +77,11 @@ function truncateOutput(raw: string): string {
   return t.content + `\n\n[Output truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full content saved to: ${tmpFile}]`;
 }
 
-// Read file and return base64 string
+// ─── File helpers ─────────────────────────────────────────────
 function fileToBase64(filePath: string): string {
-  const buf = readFileSync(filePath);
-  return buf.toString("base64");
+  return readFileSync(filePath).toString("base64");
 }
 
-// Detect MIME type from file extension
 function mimeFromPath(filePath: string): string {
   const ext = filePath.toLowerCase().split(".").pop() || "";
   const map: Record<string, string> = {
@@ -58,35 +91,83 @@ function mimeFromPath(filePath: string): string {
   return map[ext] || "image/png";
 }
 
-// Strip thinking-model artifacts from response text.
-// With thinking enabled, the final answer is in `content` (may be wrapped in
-// <|begin_of_box|>...<|end_of_box|>), reasoning is in separate `reasoning_content`.
 function cleanResponse(text: string): string {
-  return text
-    .replace(/<\|begin_of_box\|>|<\|end_of_box\|>/g, "")
-    .trim();
+  return text.replace(/<\|begin_of_box\|>|<\|end_of_box\|>/g, "").trim();
 }
 
-type VisionResult = { ok: true; text: string } | { ok: false; error: string };
+// ─── API key helpers ──────────────────────────────────────────
+function getZaiKey(): string {
+  if (process.env.Z_AI_API_KEY) return process.env.Z_AI_API_KEY;
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf-8"));
+    if (auth.zai?.key) return auth.zai.key;
+  } catch {}
+  return "";
+}
 
-/**
- * Call GLM-4.1V vision API — single-turn only.
- *
- * - prompt empty → uses DEFAULT_SCAN_PROMPT (comprehensive description)
- * - prompt provided → REPLACES default prompt entirely
- *
- * For follow-up questions on the same image, call again with the same image path
- * and a new specific prompt (e.g., "read the text in the top-right corner").
- */
-async function callVision(
-  prompt: string,
-  opts: { images?: string[]; video?: string } = {}
-): Promise<VisionResult> {
-  const apiKey = getApiKey();
+function getOllamaCloudKey(): string {
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf-8"));
+    if (auth["ollama-cloud"]?.key) return auth["ollama-cloud"].key;
+  } catch {}
+  return "";
+}
+
+// ─── Image cropping (PowerShell, no npm dependency) ───────────
+// Coordinates normalized 0-1000. Returns path to cropped PNG.
+function cropImagePS(srcPath: string, x1: number, y1: number, x2: number, y2: number): string {
+  const cx1 = Math.max(0, Math.min(1000, Math.round(x1)));
+  const cy1 = Math.max(0, Math.min(1000, Math.round(y1)));
+  const cx2 = Math.max(0, Math.min(1000, Math.round(x2)));
+  const cy2 = Math.max(0, Math.min(1000, Math.round(y2)));
+  if (cx2 <= cx1 || cy2 <= cy1) throw new Error(`Invalid crop region [${x1},${y1},${x2},${y2}]`);
+
+  const outPath = join(tmpdir(), `pi-crop-${randomUUID()}.png`);
+  const psFile = join(tmpdir(), `pi-crop-${randomUUID()}.ps1`);
+  const safeSrc = srcPath.replace(/'/g, "''");
+  const safeOut = outPath.replace(/'/g, "''");
+  const ps = `Add-Type -AssemblyName System.Drawing
+$src = [System.Drawing.Image]::FromFile('${safeSrc}')
+$w = $src.Width; $h = $src.Height
+$px1 = [int](${cx1} * $w / 1000)
+$py1 = [int](${cy1} * $h / 1000)
+$px2 = [int](${cx2} * $w / 1000)
+$py2 = [int](${cy2} * $h / 1000)
+$cw = [Math]::Max(1, $px2 - $px1)
+$ch = [Math]::Max(1, $py2 - $py1)
+$crop = New-Object System.Drawing.Bitmap($cw, $ch)
+$g = [System.Drawing.Graphics]::FromImage($crop)
+$g.DrawImage($src, (New-Object System.Drawing.Rectangle(0,0,$cw,$ch)), $px1, $py1, $cw, $ch, ([System.Drawing.GraphicsUnit]::Pixel))
+$crop.Save('${safeOut}', [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose(); $crop.Dispose(); $src.Dispose()
+`;
+  writeFileSync(psFile, ps);
+  try {
+    execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${psFile}"`, { stdio: "pipe", timeout: 15_000 });
+    if (!existsSync(outPath)) throw new Error("Crop produced no output");
+    return outPath;
+  } finally {
+    try { rmSync(psFile, { force: true }); } catch {}
+  }
+}
+
+// ─── Vision result type ───────────────────────────────────────
+type VisionResult = { ok: true; text: string; backend: string; rounds?: number } | { ok: false; error: string };
+
+type VisionOpts = {
+  images?: string[];
+  video?: string;
+  onUpdate?: (msg: string) => void;
+  /** Skip agent loop (single gemma4 call). For batch operations like PDF OCR. */
+  direct?: boolean;
+};
+
+// ─── ZAI backend (fallback) ───────────────────────────────────
+async function callZai(prompt: string, opts: VisionOpts): Promise<VisionResult> {
+  const apiKey = getZaiKey();
   if (!apiKey) return { ok: false, error: "ZAI API key not found" };
 
   const effectivePrompt = prompt.trim() || DEFAULT_SCAN_PROMPT;
-
   const content: any[] = [];
 
   for (const imgPath of opts.images || []) {
@@ -113,46 +194,189 @@ async function callVision(
   try {
     const resp = await fetch(ZAI_API_URL, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: ZAI_VISION_MODEL,
         messages: [{ role: "user", content }],
         thinking: { type: "enabled" },
       }),
     });
-
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      return { ok: false, error: `API ${resp.status}: ${errText.slice(0, 200)}` };
+      return { ok: false, error: `ZAI API ${resp.status}: ${errText.slice(0, 200)}` };
     }
-
     const data = await resp.json() as any;
     const rawText = data.choices?.[0]?.message?.content;
-    if (!rawText) return { ok: false, error: "Empty response from vision model" };
-    return { ok: true, text: cleanResponse(rawText) };
+    if (!rawText) return { ok: false, error: "Empty response from ZAI vision model" };
+    return { ok: true, text: cleanResponse(rawText), backend: "zai" };
   } catch (e: any) {
-    return { ok: false, error: e?.message || "Vision API call failed" };
+    return { ok: false, error: e?.message || "ZAI vision API call failed" };
   }
 }
 
-// ─── Error helper: return isError result instead of throwing ────
+// ─── Gemma 4 single API call ──────────────────────────────────
+async function gemma4Call(
+  apiKey: string,
+  messages: any[],
+  useTools: boolean
+): Promise<any> {
+  const body: any = { model: GEMMA4_MODEL, messages, stream: false };
+  if (useTools) body.tools = [CROP_TOOL];
+  const resp = await fetch(OLLAMA_API_URL, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    throw new Error(`Ollama API ${resp.status}: ${errText.slice(0, 200)}`);
+  }
+  return await resp.json() as any;
+}
+
+// ─── Gemma 4 direct (single call, no agent loop) ──────────────
+async function callGemma4Direct(prompt: string, imagePaths: string[]): Promise<VisionResult> {
+  const apiKey = getOllamaCloudKey();
+  if (!apiKey) return { ok: false, error: "Ollama Cloud API key not found" };
+
+  const effectivePrompt = prompt.trim() || DEFAULT_SCAN_PROMPT;
+  const images: string[] = [];
+  for (const p of imagePaths) {
+    try { images.push(fileToBase64(p)); } catch { return { ok: false, error: `Failed to read image: ${p}` }; }
+  }
+  try {
+    const data = await gemma4Call(apiKey, [{ role: "user", content: effectivePrompt, images }], false);
+    const content = cleanResponse(data.message?.content || "");
+    if (!content) return { ok: false, error: "Empty response from gemma4" };
+    return { ok: true, text: content, backend: "gemma4", rounds: 1 };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "Gemma4 API call failed" };
+  }
+}
+
+// ─── Gemma 4 agent loop (with crop_image tool) ────────────────
+// gemma4 can reverse-call crop_image to zoom into regions.
+// Loops until gemma4 returns a final answer (no tool call) or max rounds.
+async function callGemma4AgentLoop(
+  prompt: string,
+  imagePaths: string[],
+  onUpdate?: (msg: string) => void
+): Promise<VisionResult> {
+  const apiKey = getOllamaCloudKey();
+  if (!apiKey) return { ok: false, error: "Ollama Cloud API key not found" };
+  if (imagePaths.length === 0) return { ok: false, error: "No image provided" };
+
+  const effectivePrompt = (prompt.trim() || DEFAULT_SCAN_PROMPT) + CROP_HINT;
+  const mainImage = imagePaths[0];
+
+  // Load all images as base64 (Ollama format: raw base64 array, not data URL)
+  const initialImages: string[] = [];
+  for (const p of imagePaths) {
+    try { initialImages.push(fileToBase64(p)); }
+    catch { return { ok: false, error: `Failed to read image: ${p}` }; }
+  }
+
+  const messages: any[] = [
+    { role: "user", content: effectivePrompt, images: initialImages },
+  ];
+
+  const cleanupFiles: string[] = [];
+  let round = 0;
+
+  try {
+    for (; round < MAX_AGENT_ROUNDS; round++) {
+      onUpdate?.(`Analyzing${round > 0 ? ` (round ${round + 1})` : ""}...`);
+
+      let data: any;
+      try {
+        data = await gemma4Call(apiKey, messages, true);
+      } catch (e: any) {
+        return { ok: false, error: e?.message || "Gemma4 API call failed" };
+      }
+
+      const msg = data.message;
+      if (!msg) return { ok: false, error: "Empty response from gemma4" };
+
+      const toolCalls = msg.tool_calls;
+      const content = cleanResponse(msg.content || "");
+
+      // No tool call → final answer
+      if (!toolCalls || toolCalls.length === 0) {
+        if (!content) return { ok: false, error: "Empty final response from gemma4" };
+        return { ok: true, text: content, backend: "gemma4", rounds: round + 1 };
+      }
+
+      // Process tool calls — add assistant turn to history
+      messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
+
+      for (const tc of toolCalls) {
+        if (tc.function?.name !== "crop_image") {
+          messages.push({ role: "user", content: `Unknown tool "${tc.function?.name}". Provide your answer directly.` });
+          continue;
+        }
+        let args: any;
+        try {
+          args = typeof tc.function.arguments === "string"
+            ? JSON.parse(tc.function.arguments)
+            : tc.function.arguments;
+        } catch {
+          messages.push({ role: "user", content: "Invalid crop arguments. Try again or provide your answer." });
+          continue;
+        }
+        const { x1, y1, x2, y2 } = args;
+        onUpdate?.(`Cropping [${x1},${y1},${x2},${y2}]...`);
+        try {
+          const croppedPath = cropImagePS(mainImage, x1, y1, x2, y2);
+          cleanupFiles.push(croppedPath);
+          const croppedB64 = fileToBase64(croppedPath);
+          messages.push({
+            role: "user",
+            content: `Here is the cropped region [${x1},${y1},${x2},${y2}] at higher resolution. Continue your analysis. If you need another region, call crop_image again. When done, provide your final answer WITHOUT any tool call.`,
+            images: [croppedB64],
+          });
+        } catch (e: any) {
+          messages.push({ role: "user", content: `Crop failed for [${x1},${y1},${x2},${y2}]: ${e.message}. Try different coordinates or give your answer.` });
+        }
+      }
+    }
+
+    // Max rounds reached — final call WITHOUT tools to force an answer
+    onUpdate?.("Finalizing analysis...");
+    try {
+      const data = await gemma4Call(apiKey, messages, false);
+      const content = cleanResponse(data.message?.content || "");
+      if (content) return { ok: true, text: content, backend: "gemma4", rounds: round };
+    } catch {}
+    return { ok: false, error: `gemma4 did not produce a final answer within ${MAX_AGENT_ROUNDS} rounds` };
+  } finally {
+    for (const f of cleanupFiles) try { rmSync(f, { force: true }); } catch {}
+  }
+}
+
+// ─── Vision dispatcher ────────────────────────────────────────
+// Routes to gemma4 (default) or zai (fallback) based on available keys.
+async function callVision(prompt: string, opts: VisionOpts = {}): Promise<VisionResult> {
+  const ollamaKey = getOllamaCloudKey();
+
+  // Video: gemma4 doesn't support video → always zai
+  if (opts.video) return callZai(prompt, opts);
+
+  // Images: prefer gemma4
+  if (ollamaKey && opts.images && opts.images.length > 0) {
+    if (opts.direct) return callGemma4Direct(prompt, opts.images);
+    return callGemma4AgentLoop(prompt, opts.images, opts.onUpdate);
+  }
+
+  // Fallback: zai
+  return callZai(prompt, opts);
+}
+
+// ─── Error helper ─────────────────────────────────────────────
 function err(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true as const };
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────
-function getApiKey(): string {
-  if (process.env.Z_AI_API_KEY) return process.env.Z_AI_API_KEY;
-  try {
-    const auth = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf-8"));
-    if (auth.zai?.key) return auth.zai.key;
-  } catch {}
-  return "";
-}
-
+// ─── PDF helpers ──────────────────────────────────────────────
 function hasPdftoppm(): boolean {
   try { execSync("pdftoppm -v", { stdio: "ignore" }); return true; } catch { return false; }
 }
@@ -161,13 +385,11 @@ function hasPdftotext(): boolean {
   try { const r = execSync("pdftotext -v", { encoding: "utf8", stdio: ["pipe","pipe","pipe"] }); return true; } catch (e: any) { return (e.stdout || "").includes("pdftotext") || (e.stderr || "").includes("pdftotext"); }
 }
 
-// Try extracting text directly. Returns null if text too sparse (image-based PDF).
 function tryPdfTextExtract(pdfPath: string, pageRange?: string): { text: string; pages: number } | null {
   const tmpFile = join(tmpdir(), `pi-pdf-text-${randomUUID()}.txt`);
   try {
     let args = "";
     if (pageRange) {
-      // pdftotext supports -f first -l last page
       const parts = pageRange.split("-").map(Number);
       const first = parts[0] || 1;
       const last = parts[1] || parts[0] || 999;
@@ -177,12 +399,11 @@ function tryPdfTextExtract(pdfPath: string, pageRange?: string): { text: string;
     if (!existsSync(tmpFile)) return null;
     const text = readFileSync(tmpFile, "utf8").trim();
     if (!text) return null;
-    // Heuristic: if less than 50 non-whitespace chars per expected page, treat as image-based
     const lines = text.split("\n").filter(l => l.trim().length > 0);
     const totalChars = lines.reduce((sum, l) => sum + l.replace(/\s/g, "").length, 0);
-    const pageCount = Math.max(1, lines.filter(l => /^\f/.test(l)).length + 1); // form feeds separate pages
+    const pageCount = Math.max(1, lines.filter(l => /^\f/.test(l)).length + 1);
     const charsPerPage = totalChars / pageCount;
-    if (charsPerPage < 30) return null; // too sparse, probably image-based
+    if (charsPerPage < 30) return null;
     return { text, pages: pageCount };
   } catch { return null; }
   finally { try { rmSync(tmpFile, { force: true }); } catch {} }
@@ -205,6 +426,7 @@ function extractPDFPages(pdfPath: string, tempDir: string): string[] {
   return result;
 }
 
+// ─── Screenshot helpers ───────────────────────────────────────
 const PS_ADD_TYPE = `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W32 { [DllImport(\\"user32.dll\\")] public static extern bool GetWindowRect(IntPtr h, out RECT r); [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; } }'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing`;
 
 function takeScreenshot(window?: string): string {
@@ -246,13 +468,15 @@ function listWindows(): { name: string; title: string }[] {
   } catch { return []; }
 }
 
-// ─── Main Extension ─────────────────────────────────────────────
+// ─── Main Extension ────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   let initialized = false;
 
   async function ensureReady(): Promise<string | null> {
-    const key = getApiKey();
-    if (!key) return "ZAI API key not found. Configure auth.json (zai key).";
+    const ollamaKey = getOllamaCloudKey();
+    const zaiKey = getZaiKey();
+    if (!ollamaKey && !zaiKey)
+      return "No vision API key found. Configure auth.json with 'ollama-cloud' or 'zai' key.";
     initialized = true;
     return null;
   }
@@ -353,7 +577,7 @@ export default function (pi: ExtensionAPI) {
     name: "pdf_read_ocr",
     label: "PDF OCR Reader",
     description:
-      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via GLM-4.1V-Thinking-Flash. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils). Large outputs are truncated to 50KB with full content saved to a temp file.",
+      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils). Large outputs are truncated to 50KB with full content saved to a temp file.",
     promptSnippet: "Read scanned/image PDF files using vision OCR",
     promptGuidelines: [
       "Use pdf_read_ocr when pdf_read fails or returns empty results, indicating the PDF is image-based or scanned.",
@@ -378,10 +602,11 @@ export default function (pi: ExtensionAPI) {
 
         onUpdate?.({ content: [{ type: "text", text: `OCR: converting ${pageImages.length} pages via vision...` }] });
 
+        // Use direct mode (no agent loop) for batch PDF OCR
         const vrList = await Promise.all(pageImages.map(imgPath =>
           callVision(
             "Extract ALL text content from this page verbatim. Preserve headings, body text, captions, formulas.",
-            { images: [imgPath] }
+            { images: [imgPath], direct: true }
           )
         ));
 
@@ -437,14 +662,13 @@ export default function (pi: ExtensionAPI) {
 
       const vr = await callVision(
         params.prompt || "",
-        { images: [resolve(params.path)] }
+        { images: [resolve(params.path)], onUpdate: (msg) => onUpdate?.({ content: [{ type: "text", text: msg }] }) }
       );
       if (!vr.ok) return err(vr.error);
       return { content: [{ type: "text", text: vr.text }] };
     },
 
     renderCall(args, theme) {
-      if (args.prompt) return new Text(theme.fg("toolTitle", theme.bold("image_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
       return new Text(theme.fg("toolTitle", theme.bold("image_read ")) + theme.fg("accent", basename(args.path)), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
@@ -477,6 +701,7 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Analyzing video..." }] });
 
+      // Video always uses zai (gemma4 doesn't support video)
       const vr = await callVision(
         params.query || "Describe what is happening in this video.",
         { video: resolve(params.path) }
@@ -535,7 +760,7 @@ export default function (pi: ExtensionAPI) {
 
       const vr = await callVision(
         params.prompt || "Analyze this screenshot for UI development. Describe: 1) Overall layout and structure 2) All visible UI components and states 3) Text content and labels 4) Colors and visual hierarchy 5) Any visual issues or inconsistencies",
-        { images: [tmpFile] }
+        { images: [tmpFile], onUpdate: (msg) => onUpdate?.({ content: [{ type: "text", text: msg }] }) }
       );
 
       try { rmSync(tmpFile, { force: true }); } catch {}
@@ -550,7 +775,8 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) {
         const t = result.content?.[0]?.text || "";
-        if (t.includes("Analyzing")) return new Text(theme.fg("warning", "Analyzing UI..."), 0, 0);
+        if (t.includes("Analyzing") || t.includes("Cropping") || t.includes("round"))
+          return new Text(theme.fg("warning", "Analyzing UI..."), 0, 0);
         return new Text(theme.fg("warning", "Capturing..."), 0, 0);
       }
       if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
@@ -598,9 +824,10 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Comparing UI..." }] });
 
+      // Multi-image: use direct mode (crop targets first image only, not ideal for comparison)
       const vr = await callVision(
         params.prompt || "Compare the design reference (first image, expected) with the actual screenshot (second image). Identify all visual differences including: layout shifts, color differences, font/size mismatches, missing or extra elements, spacing issues.",
-        { images: [resolve(params.reference), tmpFile] }
+        { images: [resolve(params.reference), tmpFile], direct: true }
       );
 
       try { rmSync(tmpFile, { force: true }); } catch {}
