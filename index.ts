@@ -415,17 +415,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "image_read",
     label: "Image Reader",
-    description:
-      "Analyze image files using GLM-4.1V-Thinking vision model. Use when the current model does not support image input (PNG, JPG, WEBP, GIF, BMP). Each call is single-turn and independent — no conversation memory.",
-    promptSnippet: "Analyze image files using vision model",
+    description: "Analyze image files (PNG, JPG, WEBP, GIF, BMP). Single-turn: each call is independent.",
+    promptSnippet: "Analyze image files",
     promptGuidelines: [
-      "Use image_read when you need to analyze an image file but the current model does not support image input.",
-      "When the built-in read tool returns 'model does not support images' for an image file, use image_read instead.",
-      "PROMPT PARAMETER: If omitted, the tool runs a comprehensive scan (Type/Subject/Content/Text/Layout/Details). If provided, the prompt REPLACES the default scan entirely — be specific and direct.",
-      "SINGLE-TURN MODEL: Each call is independent. There is no conversation history. To probe different aspects of the same image, call image_read multiple times with the SAME path but DIFFERENT prompts.",
-      "TARGETED PROMPTS work best. Examples:\n  - 'Transcribe ALL visible text verbatim'\n  - 'Describe the object in the top-left quadrant'\n  - 'What colors are used in the header section?'\n  - 'Identify the bounding box of the login button as [[xmin,ymin,xmax,ymax]] normalized 0-999'",
-      "For UI element LOCATION tasks, request coordinates in [[xmin,ymin,xmax,ymax]] format normalized to 0-999 (per-mille of image dimensions). This is the model's native grounding format.",
-      "FOLLOW-UP STRATEGY: After a comprehensive scan, if specific details are needed for the task, call again with a targeted prompt. Do NOT assume the first scan captured everything.",
+      "prompt omitted → default comprehensive scan (Type/Subject/Content/Text/Layout/Details). prompt provided → replaces it entirely.",
+      "Single-turn: each call is independent, no conversation memory. To analyze the same image from different angles, call again with a new prompt.",
+      "OCR: explicitly request 'output text only, no translation, no explanation' to reduce filler.",
+      "Coordinates: request format [[xmin,ymin,xmax,ymax]] normalized 0-999 (per-mille of image dimensions). Ask for one region at a time, or explicitly request 'every element's coordinates' — do not ask for multiple regions' coordinates at once.",
+      "Frontend code: must specify scope (e.g. 'only replicate X, excluding Y') + tech stack, otherwise the model outputs placeholders/ellipsis.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the image file" }),
@@ -461,12 +458,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "video_describe",
     label: "Video Describer",
-    description: "Analyze a video file by sending it to GLM-4.1V-Thinking-Flash. Supports MP4/MOV/M4V (max 8MB).",
-    promptSnippet: "Analyze video content via vision model",
+    description: "Analyze a video file (MP4/MOV/M4V, max 8MB). Single-turn.",
+    promptSnippet: "Analyze video content",
     promptGuidelines: [
-      "Use video_describe when the user asks about the content of a video file.",
-      "SINGLE-TURN MODEL: Each call is independent. The query parameter REPLACES the default description — be specific.",
-      "For targeted analysis, provide a clear query: 'Describe the sequence of events', 'What objects appear in the video?', 'Transcribe any spoken or visible text'.",
+      "query omitted → default description. query provided → replaces it entirely.",
+      "Single-turn: each call is independent.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the video file" }),
@@ -503,16 +499,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "screenshot",
     label: "Screenshot",
-    description: "Capture a screenshot and analyze it using GLM-4.1V-Thinking-Flash. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis. Windows only (uses PowerShell for capture).",
-    promptSnippet: "Capture and analyze screen for UI development",
+    description: "Capture a screenshot (full screen or specific window) and analyze it. Windows only.",
+    promptSnippet: "Capture and analyze screen",
     promptGuidelines: [
-      "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
-      "If the user mentions a specific app or window, pass it as the 'window' parameter.",
-      "PROMPT PARAMETER: If omitted, runs a comprehensive UI analysis (layout, components, text, colors, issues). If provided, REPLACES default — be specific.",
-      "For element LOCATION, request coordinates as [[xmin,ymin,xmax,ymax]] normalized 0-999. This is the model's native grounding format.",
-      "TARGETED PROMPTS examples: 'Identify all buttons and their bounding boxes', 'Check if the login form is visible', 'Describe the navigation bar layout'.",
-      "SINGLE-TURN MODEL: Each call is independent. Call multiple times with different prompts to probe different aspects.",
-      "Windows only — uses PowerShell for screen capture.",
+      "window: window title substring (e.g. 'Chrome', 'VS Code') to capture a specific window. Omit for full screen.",
+      "prompt omitted → default UI analysis. prompt provided → replaces it entirely.",
+      "Coordinates: request format [[xmin,ymin,xmax,ymax]] 0-999. One region at a time.",
+      "Windows only.",
     ],
     parameters: Type.Object({
       window: Type.Optional(Type.String({ description: "Window title substring to capture (e.g., 'Chrome', 'VS Code'). Omit for full screen." })),
@@ -569,15 +562,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ui_compare",
     label: "UI Compare",
-    description: "Capture a screenshot and compare it against a reference design image using GLM-4.1V-Thinking-Flash. Supports specific window capture. Designed to compare design mockup with actual implementation. Windows only.",
-    promptSnippet: "Compare screen with design reference for UI diff",
+    description: "Capture a screenshot and compare it against a reference design image. Windows only.",
+    promptSnippet: "Compare screen with design reference",
     promptGuidelines: [
-      "Use ui_compare when you need to compare the current screen with a design mockup or reference image.",
-      "ui_compare captures a screenshot and compares it with the reference image for visual diff analysis.",
-      "PROMPT PARAMETER: If omitted, performs comprehensive diff (layout, colors, fonts, spacing, missing elements). If provided, REPLACES default — focus the comparison.",
-      "TARGETED PROMPTS examples: 'Compare button positions and sizes', 'Check if the color scheme matches', 'Identify missing text elements'.",
-      "SINGLE-TURN MODEL: Each call is independent. Reference image is image #1, screenshot is image #2.",
-      "Windows only — uses PowerShell for screen capture.",
+      "reference: design image path. Screenshot is the current screen. Both sent together for comparison.",
+      "window: window title substring to capture. Omit for full screen.",
+      "prompt omitted → default diff analysis. prompt provided → replaces it entirely.",
+      "Windows only.",
     ],
     parameters: Type.Object({
       reference: Type.String({ description: "Absolute path to the reference/design image file" }),
