@@ -18,8 +18,20 @@ const ZAI_VISION_MODEL = "glm-4.1v-thinking-flash";
 // Default prompt used when no specific question is given.
 // Used ONLY when params.prompt is empty/omitted.
 // Replaced entirely by params.prompt when one is provided.
+// Designed for GLM-4.1V-Thinking: concise, factual, no filler/flattery.
 const DEFAULT_SCAN_PROMPT =
-  "Describe this image in detail. Cover what you see: subjects, objects, text (transcribe verbatim), colors, layout, and any notable details. Be thorough.";
+  "You are a visual analysis assistant. Analyze the provided image and output a factual report.\n\n" +
+  "Format your response as follows:\n" +
+  "- Type: What kind of image is this (photo, screenshot, diagram, artwork, etc.)\n" +
+  "- Subject: The main subject(s) or focal point(s)\n" +
+  "- Content: Objects, people, and elements present (be specific)\n" +
+  "- Text: Transcribe ALL visible text verbatim. If none, say \"None\"\n" +
+  "- Layout: Spatial arrangement of elements (top/bottom/left/right)\n" +
+  "- Details: Colors, notable features, anomalies, or anything unusual\n\n" +
+  "Rules:\n" +
+  "- State only what you can observe. Do not guess or infer meaning beyond the image.\n" +
+  "- If you are unsure of exact text, mark it as [unclear].\n" +
+  "- Be concise. No introductory or concluding remarks.";
 
 // Truncate large output, save full content to temp file if truncated.
 function truncateOutput(raw: string): string {
