@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ChildProcess, spawn } from "node:child_process";
 import { readFileSync, existsSync, statSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve, basename, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -9,11 +8,9 @@ import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { Text } from "@earendil-works/pi-tui";
 
-// ─── MCP Client ─────────────────────────────────────────────────
-let mcpProcess: ChildProcess | null = null;
-let requestId = 0;
-const pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
-let initPromise: Promise<void> | null = null;
+// ─── GLM-4.6V-Flash API Client ──────────────────────────────────
+const ZAI_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+const ZAI_VISION_MODEL = "glm-4.6v-flash";
 
 // Truncate large output, save full content to temp file if truncated.
 function truncateOutput(raw: string): string {
@@ -24,84 +21,81 @@ function truncateOutput(raw: string): string {
   return t.content + `\n\n[Output truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full content saved to: ${tmpFile}]`;
 }
 
-function ensureMCP(apiKey: string): Promise<void> {
-  if (initPromise) return initPromise;
-  initPromise = new Promise((resolveInit, rejectInit) => {
-    mcpProcess = spawn("npx", ["-y", "@z_ai/mcp-server"], {
-      env: { ...process.env, Z_AI_API_KEY: apiKey, Z_AI_MODE: "ZAI" },
-      shell: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let buffer = "";
-    mcpProcess.stdout!.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg.id != null && pending.has(msg.id)) {
-            const { resolve, reject } = pending.get(msg.id)!;
-            pending.delete(msg.id);
-            if (msg.error) reject(new Error(msg.error.message || "MCP error"));
-            else resolve(msg.result);
-          }
-        } catch {}
-      }
-    });
-    mcpProcess.stderr!.on("data", () => {});
-    mcpProcess.on("error", (err) => {
-      for (const [, p] of pending) p.reject(new Error(`MCP spawn failed: ${err.message}`));
-      pending.clear(); initPromise = null; mcpProcess = null;
-    });
-    mcpProcess.on("exit", (code) => {
-      for (const [, p] of pending) p.reject(new Error(`MCP exited unexpectedly (code ${code})`));
-      pending.clear(); initPromise = null; mcpProcess = null;
-    });
-    sendMCP("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "pi-zai-vision-bridge", version: "1.3.0" },
-    }).then(() => {
-      sendNotification("notifications/initialized", {});
-      resolveInit();
-    }).catch(rejectInit);
-  });
-  return initPromise;
+// Read file and return base64 string (no data URI prefix, ZAI accepts raw base64)
+function fileToBase64(filePath: string): string {
+  const buf = readFileSync(filePath);
+  return buf.toString("base64");
 }
 
-function sendMCP(method: string, params: any): Promise<any> {
-  return new Promise((resolve, reject) => {
-    if (!mcpProcess || mcpProcess.killed) return reject(new Error("MCP not running"));
-    const id = ++requestId;
-    pending.set(id, { resolve, reject });
-    mcpProcess.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-    setTimeout(() => { if (pending.delete(id)) reject(new Error("MCP timeout")); }, 120_000);
-  });
-}
-
-function sendNotification(method: string, params: any) {
-  if (!mcpProcess || mcpProcess.killed) return;
-  mcpProcess.stdin!.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+// Detect MIME type from file extension
+function mimeFromPath(filePath: string): string {
+  const ext = filePath.toLowerCase().split(".").pop() || "";
+  const map: Record<string, string> = {
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+    gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+  };
+  return map[ext] || "image/png";
 }
 
 type VisionResult = { ok: true; text: string } | { ok: false; error: string };
 
-async function callVisionTool(name: string, args: Record<string, string>): Promise<VisionResult> {
-  try {
-    const result = await sendMCP("tools/call", { name, arguments: args });
-    if (result?.content) {
-      const texts = result.content.filter((c: any) => c.type === "text").map((c: any) => c.text);
-      if (texts.length > 0) return { ok: true, text: texts.join("\n") };
+// Call GLM-4.6V-Flash vision API with images and/or video and a text prompt.
+async function callVision(
+  prompt: string,
+  opts: { images?: string[]; video?: string } = {}
+): Promise<VisionResult> {
+  const apiKey = getApiKey();
+  if (!apiKey) return { ok: false, error: "ZAI API key not found" };
+
+  const content: any[] = [];
+
+  // Add images as base64 data URLs
+  for (const imgPath of opts.images || []) {
+    try {
+      const mime = mimeFromPath(imgPath);
+      const b64 = fileToBase64(imgPath);
+      content.push({ type: "image_url", image_url: { url: `data:${mime};base64,${b64}` } });
+    } catch {
+      return { ok: false, error: `Failed to read image: ${imgPath}` };
     }
-    return { ok: false, error: `${name}: empty response from vision model` };
+  }
+
+  // Add video as base64
+  if (opts.video) {
+    try {
+      const b64 = fileToBase64(opts.video);
+      content.push({ type: "video_url", video_url: { url: `data:video/mp4;base64,${b64}` } });
+    } catch {
+      return { ok: false, error: `Failed to read video: ${opts.video}` };
+    }
+  }
+
+  content.push({ type: "text", text: prompt });
+
+  try {
+    const resp = await fetch(ZAI_API_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: ZAI_VISION_MODEL,
+        messages: [{ role: "user", content }],
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return { ok: false, error: `API ${resp.status}: ${errText.slice(0, 200)}` };
+    }
+
+    const data = await resp.json() as any;
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) return { ok: false, error: "Empty response from vision model" };
+    return { ok: true, text };
   } catch (e: any) {
-    const msg = e?.message || "unknown error";
-    if (msg.includes("timeout")) return { ok: false, error: `${name}: vision model timed out (120s)` };
-    if (msg.includes("not running") || msg.includes("exited")) return { ok: false, error: `${name}: MCP server process not running` };
-    return { ok: false, error: `${name}: ${msg}` };
+    return { ok: false, error: e?.message || "Vision API call failed" };
   }
 }
 
@@ -219,11 +213,8 @@ export default function (pi: ExtensionAPI) {
 
   async function ensureReady(): Promise<string | null> {
     const key = getApiKey();
-    if (!key) return "ZAI API key not found. Set Z_AI_API_KEY env or configure auth.json.";
-    if (!initialized) {
-      try { await ensureMCP(key); initialized = true; }
-      catch (e: any) { return `Vision MCP init failed: ${e?.message || "unknown"}`; }
-    }
+    if (!key) return "ZAI API key not found. Configure auth.json (zai key).";
+    initialized = true;
     return null;
   }
 
@@ -234,7 +225,7 @@ export default function (pi: ExtensionAPI) {
 
     const initErr = await ensureReady();
     if (initErr) {
-      ctx.ui.notify("Vision MCP unavailable", "warning");
+      ctx.ui.notify("Vision API unavailable", "warning");
       return { action: "continue" };
     }
 
@@ -261,10 +252,10 @@ export default function (pi: ExtensionAPI) {
           continue;
         }
 
-        const vr = await callVisionTool("analyze_image", {
-          image_source: imageSource,
-          prompt: "Describe this image in detail, including all visible text, layout, and elements.",
-        });
+        const vr = await callVision(
+          "Describe this image in detail, including all visible text, layout, and elements.",
+          { images: [imageSource] }
+        );
         if (cleanup) try { rmSync(imageSource, { force: true }); } catch {}
         descriptions.push(vr.ok ? `Image ${i + 1}: ${vr.text}` : `Image ${i + 1}: [${vr.error}]`);
       } catch (e: any) { descriptions.push(`Image ${i + 1}: [${e.message}]`); }
@@ -284,7 +275,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Read text-based PDF files using pdftotext",
     promptGuidelines: [
       "Use pdf_read to read content from PDF files when the user asks about a PDF document.",
-      "Extraction is fast via pdftotext, no MCP quota consumed. For image-based/scanned PDFs, use pdf_read_ocr instead.",
+      "Extraction is fast via pdftotext, no vision model needed. For image-based/scanned PDFs, use pdf_read_ocr instead.",
       "Supports arbitrary page ranges — you can read page 100-110 without reading the whole document.",
       "If output is truncated, a temp file path is provided. Use the read tool with offset/limit to access specific sections.",
     ],
@@ -323,7 +314,7 @@ export default function (pi: ExtensionAPI) {
     name: "pdf_read_ocr",
     label: "PDF OCR Reader",
     description:
-      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via ZAI Vision MCP. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils). Large outputs are truncated to 50KB with full content saved to a temp file.",
+      "Read image-based/scanned PDF files using vision model OCR. Converts pages to images and extracts text via GLM-4.6V-Flash. Use when pdf_read returns no text (scanned documents, image PDFs). Supports up to 20 pages per call. Requires pdftoppm (poppler-utils). Large outputs are truncated to 50KB with full content saved to a temp file.",
     promptSnippet: "Read scanned/image PDF files using vision OCR",
     promptGuidelines: [
       "Use pdf_read_ocr when pdf_read fails or returns empty results, indicating the PDF is image-based or scanned.",
@@ -349,10 +340,10 @@ export default function (pi: ExtensionAPI) {
         onUpdate?.({ content: [{ type: "text", text: `OCR: converting ${pageImages.length} pages via vision...` }] });
 
         const vrList = await Promise.all(pageImages.map(imgPath =>
-          callVisionTool("extract_text_from_screenshot", {
-            image_source: imgPath,
-            prompt: "Extract ALL text content from this page verbatim. Preserve headings, body text, captions, formulas.",
-          })
+          callVision(
+            "Extract ALL text content from this page verbatim. Preserve headings, body text, captions, formulas.",
+            { images: [imgPath] }
+          )
         ));
 
         const results: string[] = [];
@@ -385,7 +376,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "image_read",
     label: "Image Reader",
-    description: "Read and analyze image files using ZAI Vision MCP. Use when the current model does not support image input (PNG, JPG, WEBP, GIF, BMP). Returns a detailed text description.",
+    description: "Read and analyze image files using GLM-4.6V-Flash vision model. Use when the current model does not support image input (PNG, JPG, WEBP, GIF, BMP). Returns a detailed text description.",
     promptSnippet: "Read image files using vision model",
     promptGuidelines: [
       "Use image_read when you need to analyze an image file but the current model does not support image input.",
@@ -402,10 +393,10 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Analyzing image..." }] });
 
-      const vr = await callVisionTool("analyze_image", {
-        image_source: resolve(params.path),
-        prompt: params.prompt || "Describe this image in detail, including all visible text, layout, colors, objects, and elements.",
-      });
+      const vr = await callVision(
+        params.prompt || "Describe this image in detail, including all visible text, layout, colors, objects, and elements.",
+        { images: [resolve(params.path)] }
+      );
       if (!vr.ok) return err(vr.error);
       return { content: [{ type: "text", text: vr.text }] };
     },
@@ -424,7 +415,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "video_describe",
     label: "Video Describer",
-    description: "Analyze a video file by sending it to ZAI Vision MCP. Supports MP4/MOV/M4V (max 8MB).",
+    description: "Analyze a video file by sending it to GLM-4.6V-Flash. Supports MP4/MOV/M4V (max 8MB).",
     promptSnippet: "Analyze video content via vision model",
     promptGuidelines: [
       "Use video_describe when the user asks about the content of a video file.",
@@ -442,10 +433,10 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Analyzing video..." }] });
 
-      const vr = await callVisionTool("analyze_video", {
-        video_source: resolve(params.path),
-        prompt: params.query || "Describe what is happening in this video.",
-      });
+      const vr = await callVision(
+        params.query || "Describe what is happening in this video.",
+        { video: resolve(params.path) }
+      );
       if (!vr.ok) return err(vr.error);
       return { content: [{ type: "text", text: vr.text }] };
     },
@@ -464,7 +455,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "screenshot",
     label: "Screenshot",
-    description: "Capture a screenshot and analyze it using ZAI Vision MCP. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis. Windows only (uses PowerShell for capture).",
+    description: "Capture a screenshot and analyze it using GLM-4.6V-Flash. Supports full screen or a specific window by title substring. Designed for UI development. Screenshot is temporary and deleted after analysis. Windows only (uses PowerShell for capture).",
     promptSnippet: "Capture and analyze screen for UI development",
     promptGuidelines: [
       "Use screenshot when you need to see what's currently on the user's screen, especially during UI development.",
@@ -498,10 +489,10 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Analyzing UI..." }] });
 
-      const vr = await callVisionTool("analyze_image", {
-        image_source: tmpFile,
-        prompt: params.prompt || "Analyze this screenshot for UI development. Describe: 1) Overall layout and structure 2) All visible UI components and states 3) Text content and labels 4) Colors and visual hierarchy 5) Any visual issues or inconsistencies",
-      });
+      const vr = await callVision(
+        params.prompt || "Analyze this screenshot for UI development. Describe: 1) Overall layout and structure 2) All visible UI components and states 3) Text content and labels 4) Colors and visual hierarchy 5) Any visual issues or inconsistencies",
+        { images: [tmpFile] }
+      );
 
       try { rmSync(tmpFile, { force: true }); } catch {}
       if (!vr.ok) return err(vr.error);
@@ -527,7 +518,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ui_compare",
     label: "UI Compare",
-    description: "Capture a screenshot and compare it against a reference design image using ZAI Vision MCP. Supports specific window capture. Designed to compare design mockup with actual implementation. Windows only.",
+    description: "Capture a screenshot and compare it against a reference design image using GLM-4.6V-Flash. Supports specific window capture. Designed to compare design mockup with actual implementation. Windows only.",
     promptSnippet: "Compare screen with design reference for UI diff",
     promptGuidelines: [
       "Use ui_compare when you need to compare the current screen with a design mockup or reference image.",
@@ -562,11 +553,10 @@ export default function (pi: ExtensionAPI) {
 
       onUpdate?.({ content: [{ type: "text", text: "Comparing UI..." }] });
 
-      const vr = await callVisionTool("ui_diff_check", {
-        expected_image_source: resolve(params.reference),
-        actual_image_source: tmpFile,
-        prompt: params.prompt || "Compare the design reference (expected) with the actual screenshot. Identify all visual differences including: layout shifts, color differences, font/size mismatches, missing or extra elements, spacing issues.",
-      });
+      const vr = await callVision(
+        params.prompt || "Compare the design reference (first image, expected) with the actual screenshot (second image). Identify all visual differences including: layout shifts, color differences, font/size mismatches, missing or extra elements, spacing issues.",
+        { images: [resolve(params.reference), tmpFile] }
+      );
 
       try { rmSync(tmpFile, { force: true }); } catch {}
       if (!vr.ok) return err(vr.error);
