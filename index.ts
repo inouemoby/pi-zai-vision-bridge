@@ -46,10 +46,12 @@ function mimeFromPath(filePath: string): string {
   return map[ext] || "image/png";
 }
 
-// Strip thinking-model artifacts from response text
+// Strip thinking-model artifacts from response text.
+// With thinking enabled, the final answer is in `content` (may be wrapped in
+// <|begin_of_box|>...<|end_of_box|>), reasoning is in separate `reasoning_content`.
 function cleanResponse(text: string): string {
   return text
-    .replace(/<\|begin_of_box\|>|<\|end_of_box\|>|<\|begin_of_thought\|>[\s\S]*?<\|end_of_thought\|>/g, "")
+    .replace(/<\|begin_of_box\|>|<\|end_of_box\|>/g, "")
     .trim();
 }
 
@@ -106,6 +108,7 @@ async function callVision(
       body: JSON.stringify({
         model: ZAI_VISION_MODEL,
         messages: [{ role: "user", content }],
+        thinking: { type: "enabled" },
       }),
     });
 
