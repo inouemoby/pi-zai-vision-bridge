@@ -487,7 +487,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       path: Type.String({ description: "Absolute path to the image file (ignored if session_id is provided for follow-up)" }),
       prompt: Type.Optional(Type.String({ description: "What to analyze. If omitted on first call, a comprehensive scan is performed. On follow-up calls, provide specific detail to probe." })),
-      session_id: Type.Optional(Type.String({ description: "Session ID from a previous image_read call, to continue asking questions about the same image." }),
+      session_id: Type.Optional(Type.String({ description: "Session ID from a previous image_read call, to continue asking questions about the same image." })),
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       const initErr = await ensureReady();
