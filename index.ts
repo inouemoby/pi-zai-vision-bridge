@@ -640,11 +640,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "image_read",
     label: "Image Reader",
-    description: "Analyze image files (PNG, JPG, WEBP, GIF, BMP). Single-turn: each call is independent.",
+    description: "Analyze image files (PNG, JPG, WEBP, GIF, BMP). Behavior depends on the active model: vision-capable models receive the image directly (no API round-trip); non-vision models use the vision API (gemma4 agent loop or zai fallback) to describe it.",
     promptSnippet: "Analyze image files",
     promptGuidelines: [
+      "If the active model supports images, image_read sends the image directly — no external vision API is involved. Just call it and the model will see the image.",
+      "If the active model does not support images, image_read calls the vision API (default: gemma4 with crop agent loop; fallback: zai glm-4.1v) and returns its text description.",
       "prompt omitted → default comprehensive scan (Type/Subject/Content/Text/Layout/Details). prompt provided → replaces it entirely.",
-      "Single-turn: each call is independent, no conversation memory. To analyze the same image from different angles, call again with a new prompt.",
       "OCR: explicitly request 'output text only, no translation, no explanation' to reduce filler.",
       "Coordinates: request format [[xmin,ymin,xmax,ymax]] normalized 0-999 (per-mille of image dimensions). Ask for one region at a time, or explicitly request 'every element's coordinates' — do not ask for multiple regions' coordinates at once.",
       "Frontend code: must specify scope (e.g. 'only replicate X, excluding Y') + tech stack, otherwise the model outputs placeholders/ellipsis.",
@@ -655,6 +656,32 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`Image not found: ${params.path}`);
+
+      const modelSupportsImage = _ctx?.model?.input?.includes("image") ?? false;
+
+      // If the active model can read images directly, pass the image through
+      // and let the model see it — same as the built-in read tool does.
+      // This skips the vision API round-trip entirely.
+      if (modelSupportsImage) {
+        try {
+          const buf = readFileSync(params.path);
+          const b64 = buf.toString("base64");
+          const mime = mimeFromPath(params.path);
+          const note = params.prompt
+            ? `Read image file [${mime}] — ${params.prompt}`
+            : `Read image file [${mime}]`;
+          return {
+            content: [
+              { type: "text", text: note },
+              { type: "image", data: b64, mimeType: mime },
+            ],
+          };
+        } catch (e: any) {
+          return err(`Failed to read image: ${e.message}`);
+        }
+      }
+
+      // Model can't see images — use vision API (gemma4 agent loop or zai fallback)
       const initErr = await ensureReady();
       if (initErr) return err(initErr);
 
@@ -674,7 +701,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Analyzing image..."), 0, 0);
       if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
-      return new Text(theme.fg("success", "✓ Image analyzed"), 0, 0);
+      return new Text(theme.fg("success", "✓ Image sent to model"), 0, 0);
     },
   });
 
