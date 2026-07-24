@@ -95,6 +95,19 @@ function cleanResponse(text: string): string {
   return text.replace(/<\|begin_of_box\|>|<\|end_of_box\|>/g, "").trim();
 }
 
+// ─── Image passthrough block (for vision-capable models) ──────
+// When the active model accepts image input, return images directly as
+// content blocks instead of routing through the vision API. This lets the
+// conversation model itself "see" the image — no external OCR/vision round-trip.
+function imageBlock(filePath: string): { type: "image"; data: string; mimeType: string } | null {
+  try {
+    const buf = readFileSync(filePath);
+    return { type: "image" as const, data: buf.toString("base64"), mimeType: mimeFromPath(filePath) };
+  } catch {
+    return null;
+  }
+}
+
 // ─── API key helpers ──────────────────────────────────────────
 function getZaiKey(): string {
   if (process.env.Z_AI_API_KEY) return process.env.Z_AI_API_KEY;
@@ -591,14 +604,33 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.path)) return err(`PDF not found: ${params.path}`);
       if (!hasPdftoppm()) return err("pdftoppm not installed. Install poppler-utils.");
-      const initErr = await ensureReady();
-      if (initErr) return err(initErr);
 
       const tempDir = join(tmpdir(), `pi-pdf-${randomUUID()}`);
       mkdirSync(tempDir, { recursive: true });
       try {
         const pageImages = extractPDFPages(params.path, tempDir);
         if (pageImages.length === 0) return err(`No pages extracted from ${basename(params.path)}. File may be corrupted.`);
+
+        // If the active model can read images, pass page images through directly
+        // so the model itself reads them — no external vision API needed.
+        const modelSupportsImage = _ctx?.model?.input?.includes("image") ?? false;
+
+        if (modelSupportsImage) {
+          onUpdate?.({ content: [{ type: "text", text: `Passing ${pageImages.length} page(s) to model...` }] });
+          const content: any[] = [];
+          content.push({ type: "text", text: `PDF [${basename(params.path)}] — ${pageImages.length} page(s) rendered at 150 DPI. Read all text from these page images.` });
+          if (params.prompt) content.push({ type: "text", text: `Instruction: ${params.prompt}` });
+          pageImages.forEach((p, i) => {
+            content.push({ type: "text", text: `— Page ${i + 1} —` });
+            const block = imageBlock(p);
+            if (block) content.push(block);
+            else content.push({ type: "text", text: `[failed to read page image]` });
+          });
+          return { content };
+        }
+
+        const initErr = await ensureReady();
+        if (initErr) return err(initErr);
 
         onUpdate?.({ content: [{ type: "text", text: `OCR: converting ${pageImages.length} pages via vision...` }] });
 
@@ -662,22 +694,12 @@ export default function (pi: ExtensionAPI) {
       // and let the model see it — same as the built-in read tool does.
       // This skips the vision API round-trip entirely.
       if (modelSupportsImage) {
-        try {
-          const buf = readFileSync(params.path);
-          const b64 = buf.toString("base64");
-          const mime = mimeFromPath(params.path);
-          const note = params.prompt
-            ? `Read image file [${mime}] — ${params.prompt}`
-            : `Read image file [${mime}]`;
-          return {
-            content: [
-              { type: "text", text: note },
-              { type: "image", data: b64, mimeType: mime },
-            ],
-          };
-        } catch (e: any) {
-          return err(`Failed to read image: ${e.message}`);
-        }
+        const block = imageBlock(resolve(params.path));
+        if (!block) return err(`Failed to read image: ${params.path}`);
+        const note = params.prompt
+          ? `Read image file [${block.mimeType}] — ${params.prompt}`
+          : `Read image file [${block.mimeType}]`;
+        return { content: [{ type: "text", text: note }, block] };
       }
 
       // Model can't see images — use vision API (gemma4 agent loop or zai fallback)
@@ -763,9 +785,7 @@ export default function (pi: ExtensionAPI) {
       prompt: Type.Optional(Type.String({ description: "What to analyze (e.g., 'describe the UI layout', 'check for visual bugs')" })),
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
-      const initErr = await ensureReady();
-      if (initErr) return err(initErr);
-
+      const modelSupportsImage = _ctx?.model?.input?.includes("image") ?? false;
       const target = params.window || null;
       onUpdate?.({ content: [{ type: "text", text: target ? `Capturing ${target}...` : "Capturing screen..." }] });
 
@@ -781,6 +801,21 @@ export default function (pi: ExtensionAPI) {
         }
         return err(`Screenshot failed: ${e.message}`);
       }
+
+      // If the active model can read images, pass the screenshot through directly.
+      if (modelSupportsImage) {
+        const block = imageBlock(tmpFile);
+        try { rmSync(tmpFile, { force: true }); } catch {}
+        if (!block) return err(`Failed to read screenshot: ${tmpFile}`);
+        const content: any[] = [];
+        content.push({ type: "text", text: `Screenshot captured${params.window ? ` (${params.window})` : ""}.` });
+        if (params.prompt) content.push({ type: "text", text: `Instruction: ${params.prompt}` });
+        content.push(block);
+        return { content };
+      }
+
+      const initErr = await ensureReady();
+      if (initErr) { try { rmSync(tmpFile, { force: true }); } catch {} return err(initErr); }
 
       onUpdate?.({ content: [{ type: "text", text: "Analyzing UI..." }] });
 
@@ -829,9 +864,8 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       if (!existsSync(params.reference)) return err(`Reference image not found: ${params.reference}`);
-      const initErr = await ensureReady();
-      if (initErr) return err(initErr);
 
+      const modelSupportsImage = _ctx?.model?.input?.includes("image") ?? false;
       const target = params.window || null;
       onUpdate?.({ content: [{ type: "text", text: target ? `Capturing ${target}...` : "Capturing screen..." }] });
 
@@ -847,6 +881,26 @@ export default function (pi: ExtensionAPI) {
         }
         return err(`Screenshot failed: ${e.message}`);
       }
+
+      // If the active model can read images, pass reference + screenshot through directly.
+      if (modelSupportsImage) {
+        const refBlock = imageBlock(resolve(params.reference));
+        const shotBlock = imageBlock(tmpFile);
+        try { rmSync(tmpFile, { force: true }); } catch {}
+        if (!refBlock) return err(`Failed to read reference image: ${params.reference}`);
+        if (!shotBlock) return err(`Failed to read screenshot: ${tmpFile}`);
+        const content: any[] = [];
+        content.push({ type: "text", text: `Compare the reference design against the live screenshot${params.window ? ` (${params.window})` : ""}.` });
+        if (params.prompt) content.push({ type: "text", text: `Instruction: ${params.prompt}` });
+        content.push({ type: "text", text: "Reference (expected):" });
+        content.push(refBlock);
+        content.push({ type: "text", text: "Screenshot (actual):" });
+        content.push(shotBlock);
+        return { content };
+      }
+
+      const initErr = await ensureReady();
+      if (initErr) { try { rmSync(tmpFile, { force: true }); } catch {} return err(initErr); }
 
       onUpdate?.({ content: [{ type: "text", text: "Comparing UI..." }] });
 
